@@ -1,18 +1,33 @@
 from django.utils import timezone
-from datetime import date
+from datetime import date, timedelta
+from typing import Optional
+from django.db.models import Q
 from ninja import Router
 import asignaciones
 from .validators import validar_ubicacion
 from asignaciones.services import obtener_materia_vigente_para_escaneo
+from asignaciones.services import obtener_asignaciones_docente_vigentes
 from configuracion.models import Configuracion
 from core.constants import EstadoSolicitud, TipoClase
 from .models import SolicitudEmergencia, RegistroAsistencia
 from academico.models import SlotHorario
 
 
-def registrar_entrada(docente_id: int, lat: float, lon: float, ip: str, tipo_clase: str):
+def _derivar_estado_flujo_ubicacion(resultado) -> str:
+    """Determina el estado_flujo específico según qué validación de ubicación falló."""
+    if resultado.gps_ok is False and resultado.wifi_ok is False:
+        return "error_ubicacion"
+    elif resultado.gps_ok is False:
+        return "error_gps"
+    elif resultado.wifi_ok is False:
+        return "error_wifi"
+    return "error_ubicacion"  # fallback genérico
+
+
+def registrar_entrada(docente_id: int, lat: float, lon: float, ip: str, tipo_clase: str) -> dict:
     """
     Procesa un escaneo de ENTRADA. Valida horario y ubicación.
+    Retorna un dict compatible con FichajeRichOut.
     """
     ahora = timezone.localtime()
     
@@ -24,7 +39,13 @@ def registrar_entrada(docente_id: int, lat: float, lon: float, ip: str, tipo_cla
     )
     
     if not slot_vigente:
-        return False, "No tienes ninguna clase programada para este horario."
+        return {
+            "success": False,
+            "estado_flujo": "sin_clases",
+            "mensaje": "No tenés ninguna clase programada para este horario.",
+        }
+
+    materia_nombre = slot_vigente.materia.nombre
 
     # 2. Validar que no haya fichado entrada ya
     registro_existente = RegistroAsistencia.objects.filter(
@@ -34,16 +55,34 @@ def registrar_entrada(docente_id: int, lat: float, lon: float, ip: str, tipo_cla
     ).first()
 
     if registro_existente:
-        return False, "Ya registraste tu entrada para esta clase hoy."
+        return {
+            "success": False,
+            "estado_flujo": "duplicado",
+            "materia": materia_nombre,
+            "mensaje": "Ya registraste tu entrada para esta clase hoy.",
+        }
 
     # 3. Validar ubicación (Solo si es clase presencial)
+    gps_ok = None
+    wifi_ok = None
     ubicacion_ok = None
+
     if tipo_clase == TipoClase.PRESENCIAL:
         config = Configuracion.objects.first() or Configuracion.objects.create(id=1)
-        paso_validacion, msg_error = validar_ubicacion(lat, lon, ip, config)
+        resultado_ubicacion = validar_ubicacion(lat, lon, ip, config)
+        gps_ok = resultado_ubicacion.gps_ok
+        wifi_ok = resultado_ubicacion.wifi_ok
         
-        if not paso_validacion:
-            return False, msg_error
+        if not resultado_ubicacion.ubicacion_ok:
+            return {
+                "success": False,
+                "estado_flujo": _derivar_estado_flujo_ubicacion(resultado_ubicacion),
+                "gps_ok": gps_ok,
+                "wifi_ok": wifi_ok,
+                "materia": materia_nombre,
+                "tipo_clase": tipo_clase,
+                "mensaje": resultado_ubicacion.mensaje,
+            }
         ubicacion_ok = True
 
     # 4. Registrar en la base de datos
@@ -60,12 +99,22 @@ def registrar_entrada(docente_id: int, lat: float, lon: float, ip: str, tipo_cla
         ip_registrada=ip
     )
 
-    return True, f"Entrada registrada exitosamente para {slot_vigente.materia.nombre}."
+    return {
+        "success": True,
+        "estado_flujo": "exito",
+        "gps_ok": gps_ok,
+        "wifi_ok": wifi_ok,
+        "materia": materia_nombre,
+        "hora_fichada": ahora.strftime("%H:%M"),
+        "tipo_clase": tipo_clase,
+        "mensaje": f"Entrada registrada exitosamente para {materia_nombre}.",
+    }
 
 
-def registrar_salida(docente_id: int):
+def registrar_salida(docente_id: int, lat: float, lon: float, ip: str) -> dict:
     """
-    Procesa un escaneo de SALIDA.
+    Procesa un escaneo de SALIDA. Valida ubicación para clases presenciales.
+    Retorna un dict compatible con FichajeRichOut.
     """
     ahora = timezone.localtime()
     
@@ -73,40 +122,80 @@ def registrar_salida(docente_id: int):
     registro_pendiente = RegistroAsistencia.objects.filter(
         docente_id=docente_id,
         fecha=ahora.date(),
+        hora_entrada__isnull=False,
         hora_salida__isnull=True
     ).order_by('-hora_entrada').first()
 
     if not registro_pendiente:
-        return False, "No tienes ninguna entrada activa para registrar salida."
+        return {
+            "success": False,
+            "estado_flujo": "sin_clases",
+            "mensaje": "No tenés ninguna entrada activa para registrar salida.",
+        }
+
+    materia_nombre = registro_pendiente.slot_horario.materia.nombre
+    tipo_clase = registro_pendiente.tipo_clase
+
+    # 2. Validar ubicación (Solo si es clase presencial)
+    gps_ok = None
+    wifi_ok = None
+
+    if tipo_clase == TipoClase.PRESENCIAL:
+        config = Configuracion.objects.first() or Configuracion.objects.create(id=1)
+        resultado_ubicacion = validar_ubicacion(lat, lon, ip, config)
+        gps_ok = resultado_ubicacion.gps_ok
+        wifi_ok = resultado_ubicacion.wifi_ok
+        
+        if not resultado_ubicacion.ubicacion_ok:
+            return {
+                "success": False,
+                "estado_flujo": _derivar_estado_flujo_ubicacion(resultado_ubicacion),
+                "gps_ok": gps_ok,
+                "wifi_ok": wifi_ok,
+                "materia": materia_nombre,
+                "tipo_clase": tipo_clase,
+                "mensaje": resultado_ubicacion.mensaje,
+            }
 
     # Actualizamos el registro con la hora de salida
     registro_pendiente.hora_salida = ahora
     registro_pendiente.save()
 
-    return True, f"Salida registrada exitosamente para {registro_pendiente.slot_horario.materia.nombre}."
+    return {
+        "success": True,
+        "estado_flujo": "exito",
+        "gps_ok": gps_ok,
+        "wifi_ok": wifi_ok,
+        "materia": materia_nombre,
+        "hora_fichada": ahora.strftime("%H:%M"),
+        "tipo_clase": tipo_clase,
+        "mensaje": f"Salida registrada exitosamente para {materia_nombre}.",
+    }
 
 
-def procesar_solicitud_emergencia(docente_id: int, slot_id: int, nota: str):
+def procesar_solicitud_emergencia(docente_id: int, slot_id: Optional[int], nota: str, fecha: Optional[date] = None):
     """
     Crea la alerta desde el celular del docente.
     """
-    ahora = timezone.localtime()
+    if fecha is None:
+        fecha = timezone.localdate()
     
     # Validamos que el slot exista si lo envió
     slot = SlotHorario.objects.filter(id=slot_id).first() if slot_id else None
     
-    # Prevenimos spam: que no mande 20 alertas iguales
-    if SolicitudEmergencia.objects.filter(docente_id=docente_id, fecha=ahora.date(), estado=EstadoSolicitud.PENDIENTE).exists():
-        return False, "Ya tienes una solicitud pendiente de revisión para el día de hoy."
+    # Prevenimos spam: que no mande 20 alertas iguales para la misma fecha
+    if SolicitudEmergencia.objects.filter(docente_id=docente_id, fecha=fecha, estado=EstadoSolicitud.PENDIENTE).exists():
+        return False, "Ya tenés una solicitud pendiente de revisión para la fecha indicada."
 
     SolicitudEmergencia.objects.create(
         docente_id=docente_id,
         slot_horario=slot,
-        fecha=ahora.date(),
+        fecha=fecha,
         nota_docente=nota,
         estado=EstadoSolicitud.PENDIENTE
     )
     return True, "Solicitud de emergencia enviada a Secretaría."
+
 
 def resolver_emergencia(solicitud_id: int, aprobar: bool, nota_secretaria: str, usuario_admin):
     """
@@ -123,23 +212,46 @@ def resolver_emergencia(solicitud_id: int, aprobar: bool, nota_secretaria: str, 
         solicitud.estado = EstadoSolicitud.APROBADA
         
         # --- LA GENERACIÓN MÁGICA DE ASISTENCIA ---
-        # Si el profesor no sabía qué slot era, necesitamos que la Secretaría lo asigne antes (acá asumimos que ya está)
+        slots_to_process = []
         if solicitud.slot_horario:
-            RegistroAsistencia.objects.create(
+            slots_to_process.append(solicitud.slot_horario)
+        else:
+            # Emergencia general: Buscar todas las materias asignadas al docente vigentes en esa fecha
+            dia_semana_val = solicitud.fecha.weekday()
+            
+            materias_ids = obtener_asignaciones_docente_vigentes(
+                solicitud.docente_id,
+                solicitud.fecha,
+            ).values_list('materia_id', flat=True)
+            
+            slots_to_process = list(SlotHorario.objects.filter(
+                materia_id__in=materias_ids,
+                dia_semana=dia_semana_val
+            ))
+
+        for slot in slots_to_process:
+            # Verificar si ya existe registro de asistencia para evitar duplicados
+            exists = RegistroAsistencia.objects.filter(
                 docente_id=solicitud.docente_id,
-                slot_horario=solicitud.slot_horario,
-                fecha=solicitud.fecha,
-                anio=solicitud.fecha.year,
-                tipo_clase=TipoClase.PRESENCIAL, # Asumimos presencial porque por asincrónica no hay emergencia de QR
-                
-                # Simulamos que entró y salió a la hora perfecta del slot
-                hora_entrada=timezone.datetime.combine(solicitud.fecha, solicitud.slot_horario.hora_inicio),
-                hora_salida=timezone.datetime.combine(solicitud.fecha, solicitud.slot_horario.hora_fin),
-                
-                ubicacion_validada=True, # Secretaría avala
-                solicitud_emergencia=solicitud, # Vinculamos el registro con la emergencia para auditoría
-                nota=f"Fichaje manual por emergencia (Autorizado por: {usuario_admin.get_full_name()})"
-            )
+                slot_horario=slot,
+                fecha=solicitud.fecha
+            ).exists()
+            
+            if not exists:
+                RegistroAsistencia.objects.create(
+                    docente_id=solicitud.docente_id,
+                    slot_horario=slot,
+                    fecha=solicitud.fecha,
+                    anio=solicitud.fecha.year,
+                    tipo_clase=TipoClase.PRESENCIAL, # Asumimos presencial
+                    
+                    # Simulamos que entró y salió a la hora perfecta del slot
+                    hora_entrada=timezone.make_aware(timezone.datetime.combine(solicitud.fecha, slot.hora_inicio)),
+                    hora_salida=timezone.make_aware(timezone.datetime.combine(solicitud.fecha, slot.hora_fin)),
+                    ubicacion_validada=True, # Secretaría avala
+                    solicitud_emergencia=solicitud, # Vinculamos el registro con la emergencia para auditoría
+                    nota=f"Fichaje manual por emergencia (Autorizado por: {usuario_admin.get_full_name()})"
+                )
     else:
         solicitud.estado = EstadoSolicitud.RECHAZADA
 
@@ -155,9 +267,12 @@ def declarar_clase_asincronica(docente_id: int, slot_id: int, fecha_dictado: dat
     """
     Registra una clase asincrónica basada en la presunción de verdad del docente.
     """
-    # 1. Evitar declaraciones futuras (Opcional, según política de ICES)
-    if fecha_dictado > timezone.localdate():
-        return False, "No puedes declarar asistencia para fechas futuras."
+    # 1. Validar que la fecha esté en el rango permitido (hasta 7 días antes o después)
+    hoy = timezone.localdate()
+    if fecha_dictado > hoy + timedelta(days=8):
+        return False, "No podés declarar asistencia con más de 7 días de anticipación."
+    if fecha_dictado < hoy - timedelta(days=8):
+        return False, "No podés declarar asistencia para fechas con más de 7 días de antigüedad."
 
     # 2. Validar que el slot exista y coincida con el día de la semana
     slot = SlotHorario.objects.filter(id=slot_id).select_related('materia').first()
@@ -172,11 +287,12 @@ def declarar_clase_asincronica(docente_id: int, slot_id: int, fecha_dictado: dat
         docente_id=docente_id,
         materia_id=slot.materia_id,
         activa=True,
-        fecha_inicio__lte=fecha_dictado
+        fecha_inicio__lte=fecha_dictado,
+        materia__activa=True,
     ).first()
 
     if not asignacion_activa:
-        return False, "No tienes una asignación activa para esta materia en la fecha indicada."
+        return False, "No tenés una asignación activa para esta materia en la fecha indicada."
 
     # 4. Validar duplicados (Que no haya fichado presencial o asincrónico antes ese mismo día)
     if RegistroAsistencia.objects.filter(docente_id=docente_id, slot_horario_id=slot_id, fecha=fecha_dictado).exists():

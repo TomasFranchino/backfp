@@ -1,6 +1,7 @@
+import logging
 import pandas as pd
 import unicodedata
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.contrib.auth.hashers import make_password
 from datetime import date, datetime, time
 
@@ -8,6 +9,10 @@ from usuarios.models import Usuario, Docente
 from academico.models import Carrera, Materia, MateriaCarrera, SlotHorario
 from asignaciones.models import AsignacionDocente
 from core.constants import RolDocente
+from core.exceptions import ImportacionDataError, ImportacionSystemError
+
+
+logger = logging.getLogger(__name__)
 
 def normalizar_texto(texto: str) -> str:
     """Elimina acentos, espacios extra y convierte a mayúsculas para comparar."""
@@ -42,7 +47,7 @@ def parse_date(val):
         return val.to_pydatetime().date()
     try:
         return datetime.strptime(str(val).strip(), '%Y-%m-%d').date()
-    except Exception:
+    except (TypeError, ValueError):
         raise ValueError(f"Formato de fecha inválido: {val}")
 
 def parse_time(val):
@@ -67,7 +72,9 @@ def procesar_archivo_siu(archivo, usuario_creador):
     try:
         sheets = pd.read_excel(archivo, sheet_name=None)
     except Exception as e:
-        raise ValueError(f"No se pudo leer el archivo Excel: {str(e)}")
+        logger.exception("No se pudo leer el archivo Excel SIU")
+        raise ImportacionDataError(f"No se pudo leer el archivo Excel: {str(e)}") from e
+
 
     def find_sheet_df(prefix):
         for name, df in sheets.items():
@@ -95,6 +102,12 @@ def procesar_archivo_siu(archivo, usuario_creador):
 
     # Transacción atómica global
     with transaction.atomic():
+        # Inicialización de cachés para evitar consultas N+1
+        carreras_cache = {c.codigo: c for c in Carrera.objects.all()}
+        materias_cache = {m.codigo_siu: m for m in Materia.objects.all()}
+        usuarios_cache = {u.username: u for u in Usuario.objects.all()}
+        docentes_cache = {d.user.username: d for d in Docente.objects.select_related('user').all()}
+
         # --- 1. Carreras ---
         for idx, row in df_carreras.iterrows():
             fila_num = idx + 2
@@ -107,7 +120,7 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     duracion_anios = clean_int(row.get('duracion_anios'))
                     
                     if not codigo:
-                        raise ValueError("El campo 'codigo' es obligatorio")
+                        raise ValueError("El campo 'código' es obligatorio")
                     if not nombre:
                         raise ValueError("El campo 'nombre' es obligatorio")
                     if duracion_anios is None:
@@ -121,14 +134,20 @@ def procesar_archivo_siu(archivo, usuario_creador):
                             'creado_por': usuario_creador
                         }
                     )
+                    carreras_cache[codigo] = carrera
                     if created:
                         resumen["carreras_creadas"] += 1
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": carreras_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", carreras_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{carreras_name}', fila {fila_num}."
+                ) from e
 
         # --- 2. Docentes ---
         for idx, row in df_docentes.iterrows():
@@ -155,13 +174,13 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     if not email:
                         email = f"{username}@ices.edu.ar"
                     
-                    try:
-                        usuario = Usuario.objects.get(username=username)
+                    usuario = usuarios_cache.get(username)
+                    if usuario:
                         usuario.first_name = first_name
                         usuario.last_name = last_name
                         usuario.email = email
                         usuario.save()
-                    except Usuario.DoesNotExist:
+                    else:
                         usuario = Usuario.objects.create_user(
                             username=username,
                             email=email,
@@ -169,19 +188,30 @@ def procesar_archivo_siu(archivo, usuario_creador):
                             first_name=first_name,
                             last_name=last_name
                         )
+                        usuarios_cache[username] = usuario
 
-                    docente, doc_created = Docente.objects.get_or_create(
-                        user=usuario,
-                        defaults={'creado_por': usuario_creador}
-                    )
+                    docente = docentes_cache.get(username)
+                    if docente:
+                        doc_created = False
+                    else:
+                        docente, doc_created = Docente.objects.get_or_create(
+                            user=usuario,
+                            defaults={'creado_por': usuario_creador}
+                        )
+                        docentes_cache[username] = docente
                     if doc_created:
                         resumen["docentes_creados"] += 1
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": docentes_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", docentes_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{docentes_name}', fila {fila_num}."
+                ) from e
 
         # --- 3. Materias ---
         for idx, row in df_materias.iterrows():
@@ -209,14 +239,20 @@ def procesar_archivo_siu(archivo, usuario_creador):
                             'creado_por': usuario_creador
                         }
                     )
+                    materias_cache[codigo_siu] = materia
                     if created:
                         resumen["materias_creadas"] += 1
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": materias_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", materias_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{materias_name}', fila {fila_num}."
+                ) from e
 
         # --- 4. MateriaCarrera ---
         for idx, row in df_materia_carrera.iterrows():
@@ -236,15 +272,13 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     if anio_plan is None:
                         raise ValueError("El campo 'anio_plan' es obligatorio")
                     
-                    try:
-                        materia = Materia.objects.get(codigo_siu=codigo_materia)
-                    except Materia.DoesNotExist:
+                    materia = materias_cache.get(codigo_materia)
+                    if not materia:
                         raise ValueError(f"Materia con codigo_siu '{codigo_materia}' no existe")
                         
-                    try:
-                        carrera = Carrera.objects.get(codigo=codigo_carrera)
-                    except Carrera.DoesNotExist:
-                        raise ValueError(f"Carrera con codigo '{codigo_carrera}' no existe")
+                    carrera = carreras_cache.get(codigo_carrera)
+                    if not carrera:
+                        raise ValueError(f"Carrera con código '{codigo_carrera}' no existe")
                     
                     materia_carrera, created = MateriaCarrera.objects.update_or_create(
                         materia=materia,
@@ -254,12 +288,17 @@ def procesar_archivo_siu(archivo, usuario_creador):
                             'creado_por': usuario_creador
                         }
                     )
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": materia_carrera_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", materia_carrera_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{materia_carrera_name}', fila {fila_num}."
+                ) from e
 
         # --- 5. Horarios ---
         for idx, row in df_horarios.iterrows():
@@ -286,9 +325,8 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     if hora_inicio >= hora_fin:
                         raise ValueError(f"La hora de inicio ({hora_inicio}) debe ser menor que la hora de fin ({hora_fin})")
                     
-                    try:
-                        materia = Materia.objects.get(codigo_siu=codigo_materia)
-                    except Materia.DoesNotExist:
+                    materia = materias_cache.get(codigo_materia)
+                    if not materia:
                         raise ValueError(f"Materia con codigo_siu '{codigo_materia}' no existe")
                     
                     slot, created = SlotHorario.objects.get_or_create(
@@ -302,12 +340,17 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     )
                     if created:
                         resumen["horarios_creados"] += 1
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": horarios_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", horarios_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{horarios_name}', fila {fila_num}."
+                ) from e
 
         # --- 6. Asignaciones ---
         for idx, row in df_asignaciones.iterrows():
@@ -329,15 +372,12 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     if not fecha_inicio:
                         raise ValueError("El campo 'fecha_inicio' es obligatorio")
                     
-                    try:
-                        usuario = Usuario.objects.get(username=username_docente)
-                        docente = Docente.objects.get(user=usuario)
-                    except (Usuario.DoesNotExist, Docente.DoesNotExist):
+                    docente = docentes_cache.get(username_docente)
+                    if not docente:
                         raise ValueError(f"Docente con DNI '{username_docente}' no existe")
                     
-                    try:
-                        materia = Materia.objects.get(codigo_siu=codigo_materia)
-                    except Materia.DoesNotExist:
+                    materia = materias_cache.get(codigo_materia)
+                    if not materia:
                         raise ValueError(f"Materia con codigo_siu '{codigo_materia}' no existe")
                     
                     rol_texto = clean_str(rol_val).lower() if rol_val else 'titular'
@@ -356,12 +396,17 @@ def procesar_archivo_siu(archivo, usuario_creador):
                     )
                     if created:
                         resumen["asignaciones_creadas"] += 1
-            except Exception as e:
+            except (ValueError, IntegrityError) as e:
                 resumen["errores"].append({
                     "pestana": asignaciones_name,
                     "fila": fila_num,
                     "error": str(e)
                 })
+            except Exception as e:
+                logger.exception("Error inesperado procesando %s fila %s", asignaciones_name, fila_num)
+                raise ImportacionSystemError(
+                    f"Error inesperado procesando la pestaña '{asignaciones_name}', fila {fila_num}."
+                ) from e
 
     resumen["success"] = len(resumen["errores"]) == 0
     return resumen

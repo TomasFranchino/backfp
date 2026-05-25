@@ -1,5 +1,4 @@
 from ninja import Router
-from ninja.security import django_auth
 from django.shortcuts import get_object_or_404
 from typing import List
 from core.security import secretario_auth
@@ -36,6 +35,23 @@ def crear_asignacion(request, payload: AsignacionDocenteIn):
         **datos
     )
     return 201, asignacion
+
+@router.put("/{asignacion_id}", response={200: AsignacionDocenteOut, 400: MensajeOut})
+def actualizar_asignacion(request, asignacion_id: int, payload: AsignacionDocenteIn):
+    """Actualiza una asignación existente."""
+    asignacion = get_object_or_404(AsignacionDocente, id=asignacion_id)
+    docente = get_object_or_404(Docente, id=payload.docente)
+    materia = get_object_or_404(Materia, id=payload.materia)
+    
+    asignacion.docente = docente
+    asignacion.materia = materia
+    asignacion.rol = payload.rol
+    asignacion.fecha_inicio = payload.fecha_inicio
+    asignacion.fecha_fin = payload.fecha_fin
+    asignacion.modificado_por = request.user
+    asignacion.save()
+    
+    return 200, asignacion
 
 @router.delete("/{asignacion_id}", response={200: MensajeOut})
 def desactivar_asignacion(request, asignacion_id: int):

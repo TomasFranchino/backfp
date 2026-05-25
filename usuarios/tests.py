@@ -53,7 +53,7 @@ class DashboardStatsTests(TestCase):
             docente=self.docente,
             slot_horario=self.slot_hoy,
             fecha=self.hoy,
-            nota_docente="Problema con el proyector",
+            nota_docente="Problema técnico con el sistema de fichaje",
             estado=EstadoSolicitud.PENDIENTE
         )
         

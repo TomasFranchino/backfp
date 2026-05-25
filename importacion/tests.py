@@ -98,7 +98,7 @@ class ImportacionSIUTestCase(TestCase):
         # 1. Crear data para excel, algunas filas tienen errores intencionales
         df_carreras = pd.DataFrame([
             {'codigo': 'TPI', 'nombre': 'Tecnicatura en Programación', 'duracion_anios': 3},
-            {'codigo': '', 'nombre': 'Carrera Incompleta Sin Codigo', 'duracion_anios': 2} # Error: sin codigo
+            {'codigo': '', 'nombre': 'Carrera Incompleta Sin Código', 'duracion_anios': 2} # Error: sin codigo
         ])
         
         df_docentes = pd.DataFrame([

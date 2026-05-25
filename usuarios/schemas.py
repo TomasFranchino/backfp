@@ -23,7 +23,7 @@ class MensajeOut(Schema):
 
 class UsuarioRegistroIn(Schema):
     username: str
-    email: str
+    email: EmailStr
     password: str
     first_name: str
     last_name: str
@@ -68,4 +68,4 @@ class DashboardStatsOut(Schema):
     docentes_activos: int
     emergencias_pendientes: int
     clases_hoy: int
-    docentes_en_aula: list[DocenteEnAulaOut]
+    docentes_en_aula: list[DocenteEnAulaOut]

@@ -13,7 +13,7 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 from pathlib import Path
 from dotenv import load_dotenv
 import os
-
+from corsheaders.defaults import default_headers
 
 
 
@@ -26,13 +26,18 @@ load_dotenv()
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-=55phk46&aq2lg91r$ciqatx&i#(b*8+sfpm@7yy2t#xthnqbz'
+SECRET_KEY = os.getenv('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv('DEBUG') # Cambiar a False en producción
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS').split(',')  # Permitir todas las IPs (solo para desarrollo, en producción especificar dominios)
+ # Permitir todas las IPs (solo para desarrollo, en producción especificar dominios)
+CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False').lower() == 'true'  # Leer desde .env y convertir a booleano
+CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS').split(',')  #VA FRONT Leer desde .env y convertir a lista URL FRONTEND
 
-ALLOWED_HOSTS = ['*']  # Permitir todas las IPs (solo para desarrollo, en producción especificar dominios)
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-skip-toast',
+]
 
 # --- CONFIGURACIÓN DE SESIONES Y COOKIES ---
 
@@ -44,17 +49,18 @@ SESSION_SAVE_EVERY_REQUEST = True
 
 # 3. Seguridad exigida en RNF-06
 SESSION_COOKIE_HTTPONLY = True # Javascript (React) NO puede leer la cookie
-SESSION_COOKIE_SECURE = False   # Solo viaja por HTTPS (poner False solo en desarrollo local)
 
 # 4. Asegurarse de que el frontend (React) envíe las credenciales en peticiones CORS
 CORS_ALLOW_CREDENTIALS = True 
 CSRF_COOKIE_HTTPONLY = False   # Debe ser False para que Axios pueda leerlo y mandarlo en el header
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+
+
+
+SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'False').lower() == 'true'  # En producción, cambiar a True para que solo se envíe por HTTPS
+CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'False').lower() == 'true'     # En producción, cambiar a True para que solo se
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False').lower() == 'true'  # En producción, cambiar a True para redirigir HTTP a HTTPS
+
+CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_ORIGINS').split(',')  #VA FRONT Leer desde .env y convertir a lista
 # Le indicamos a Django que use nuestro Custom User
 AUTH_USER_MODEL = 'usuarios.Usuario'
 
@@ -83,6 +89,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -115,7 +122,24 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
-DATABASES = {
+if os.environ.get("SUPABASE_DB_HOST"):
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get("SUPABASE_DB_NAME", "postgres"),
+            'USER': os.environ.get("SUPABASE_DB_USER"),
+            'PASSWORD': os.environ.get("SUPABASE_DB_PASSWORD"),
+            'HOST': os.environ.get("SUPABASE_DB_HOST"),
+            'PORT': os.environ.get("SUPABASE_DB_PORT", "6543"),
+            
+            # Opcional pero recomendado para Supabase:
+            # Mantiene la conexión abierta 10 minutos para que el backend responda más rápido
+            'CONN_MAX_AGE': 600, 
+        }
+    }
+else:
+    # Si no están las variables de Supabase, usamos tu base local
+    DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': os.getenv('NAME'),
@@ -149,7 +173,7 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/4.2/topics/i18n/
 
-LANGUAGE_CODE = 'en-us'
+LANGUAGE_CODE = 'es-ar'
 
 TIME_ZONE = 'America/Argentina/Buenos_Aires'
 
@@ -162,7 +186,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 STATIC_URL = 'static/'
-
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 

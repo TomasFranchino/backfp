@@ -1,6 +1,4 @@
 from ninja import ModelSchema, Schema
-from datetime import date
-from typing import Optional
 
 from .models import AsignacionDocente
 

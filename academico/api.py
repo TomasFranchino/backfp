@@ -1,10 +1,10 @@
 from ninja import Router
-from ninja.security import django_auth
 from django.shortcuts import get_object_or_404
 from typing import List
 from core.security import secretario_auth
 
 from .models import Carrera, Materia, SlotHorario
+from asignaciones.models import AsignacionDocente
 from .schemas import (
     CarreraIn, CarreraOut,
     MateriaIn, MateriaOut,
@@ -84,6 +84,10 @@ def actualizar_materia(request, materia_id: int, payload: MateriaIn):
 def borrar_materia(request, materia_id: int):
     """Borrado lógico de la materia."""
     materia = get_object_or_404(Materia, id=materia_id)
+    AsignacionDocente.objects.filter(materia=materia, activa=True).update(
+        activa=False,
+        modificado_por=request.user,
+    )
     materia.activa = False
     materia.modificado_por = request.user
     materia.save()

@@ -1,8 +1,9 @@
-from datetime import timedelta
+from datetime import date, timedelta
+from typing import Optional
 from ninja import Router
 from core.security import docente_auth
 from django.utils import timezone
-from .schemas import FichajeEntradaIn, FichajeOut, EstadoFichajeOut, MateriaStatsOut
+from .schemas import FichajeEntradaIn, FichajeOut, FichajeRichOut, EstadoFichajeOut, MateriaStatsOut
 from .services import declarar_clase_asincronica, registrar_entrada, registrar_salida
 from .models import RegistroAsistencia
 from core.security import secretario_auth 
@@ -12,8 +13,11 @@ from .models import SolicitudEmergencia
 from core.constants import EstadoSolicitud, TipoClase
 from .schemas import DeclaracionAsincronicaIn, ClaseDisponibleOut
 from asignaciones.models import AsignacionDocente
+from asignaciones.services import obtener_asignaciones_docente_vigentes
 from academico.models import SlotHorario
-from calendario.services import is_fecha_bloqueada
+from calendario.services import is_fecha_bloqueada, obtener_evento_bloqueo
+from asignaciones.services import obtener_materia_vigente_para_escaneo, obtener_proxima_clase_hoy
+from configuracion.models import Configuracion
 
 
 # Solo docentes logueados pueden escanear
@@ -30,7 +34,8 @@ def get_client_ip(request):
 def verificar_estado_actual(request):
     """
     React llama a este endpoint apenas se abre la cámara.
-    Sirve para saber si mostrar el botón Verde (Entrada) o Rojo (Salida).
+    Sirve para saber si mostrar el botón Verde (Entrada) o Rojo (Salida),
+    y ahora también para informar la clase vigente o la próxima clase del día.
     """
     docente_id = request.user.docente.id
     ahora = timezone.localtime()
@@ -38,44 +43,93 @@ def verificar_estado_actual(request):
     registro_activo = RegistroAsistencia.objects.filter(
         docente_id=docente_id,
         fecha=ahora.date(),
+        hora_entrada__isnull=False,
         hora_salida__isnull=True
     ).first()
 
-    if registro_activo:
-        return {
-            "tiene_entrada_activa": True,
-            "materia_actual": registro_activo.slot_horario.materia.nombre,
-            "hora_entrada": registro_activo.hora_entrada.strftime("%H:%M")
-        }
-    
-    return {"tiene_entrada_activa": False}
+    # Estructura base de respuesta
+    response = {
+        "tiene_entrada_activa": False,
+        "materia_actual": None,
+        "hora_entrada": None,
+        "clase_vigente": None,
+        "proxima_clase": None,
+        "metodo_validacion": None
+    }
 
-@router.post("/chequeoprofesor/entrada", response={200: FichajeOut, 400: FichajeOut})
+    if registro_activo:
+        response["tiene_entrada_activa"] = True
+        response["materia_actual"] = registro_activo.slot_horario.materia.nombre
+        response["hora_entrada"] = registro_activo.hora_entrada.strftime("%H:%M")
+    else:
+        # 1. Si no hay entrada activa, buscar clase vigente
+        slot_vigente = obtener_materia_vigente_para_escaneo(
+            docente_id=docente_id,
+            fecha_actual=ahora.date(),
+            hora_actual=ahora.time()
+        )
+        if slot_vigente:
+            response["clase_vigente"] = slot_vigente.materia.nombre
+        else:
+            # 2. Si no hay vigente, buscar próxima clase del día
+            proxima = obtener_proxima_clase_hoy(
+                docente_id=docente_id,
+                fecha_actual=ahora.date(),
+                hora_actual=ahora.time()
+            )
+            if proxima:
+                dummy_date = ahora.date()
+                dt_inicio = timezone.datetime.combine(dummy_date, proxima.hora_inicio)
+                # Ventana de fichaje es 60 mins antes del inicio de la clase
+                fichable_desde_dt = dt_inicio - timedelta(minutes=60)
+                
+                response["proxima_clase"] = {
+                    "materia_nombre": proxima.materia.nombre,
+                    "hora_inicio": proxima.hora_inicio.strftime("%H:%M"),
+                    "hora_fin": proxima.hora_fin.strftime("%H:%M"),
+                    "fichable_desde": fichable_desde_dt.strftime("%H:%M")
+                }
+    
+    # 3. Incluir siempre el método de validación configurado
+    config = Configuracion.objects.first()
+    response["metodo_validacion"] = config.metodo_validacion_ubicacion if config else None
+
+    return response
+
+@router.post("/chequeoprofesor/entrada", response={200: FichajeRichOut, 400: FichajeRichOut})
 def endpoint_fichar_entrada(request, payload: FichajeEntradaIn):
     """Endpoint que se dispara al confirmar la ENTRADA tras escanear el QR."""
     docente_id = request.user.docente.id
     ip_cliente = get_client_ip(request)
     
-    exito, mensaje = registrar_entrada(
+    resultado = registrar_entrada(
         docente_id=docente_id,
         lat=payload.latitud,
         lon=payload.longitud,
         ip=ip_cliente,
         tipo_clase=payload.tipo_clase
     )
+    resultado["docente_nombre"] = request.user.get_full_name()
     
-    status_code = 200 if exito else 400
-    return status_code, {"success": exito, "mensaje": mensaje}
+    status_code = 200 if resultado["success"] else 400
+    return status_code, resultado
 
-@router.post("/chequeoprofesor/salida", response={200: FichajeOut, 400: FichajeOut})
-def endpoint_fichar_salida(request):
+@router.post("/chequeoprofesor/salida", response={200: FichajeRichOut, 400: FichajeRichOut})
+def endpoint_fichar_salida(request, payload: FichajeEntradaIn):
     """Endpoint que se dispara al confirmar la SALIDA tras escanear el QR."""
     docente_id = request.user.docente.id
+    ip_cliente = get_client_ip(request)
     
-    exito, mensaje = registrar_salida(docente_id)
+    resultado = registrar_salida(
+        docente_id=docente_id,
+        lat=payload.latitud,
+        lon=payload.longitud,
+        ip=ip_cliente
+    )
+    resultado["docente_nombre"] = request.user.get_full_name()
     
-    status_code = 200 if exito else 400
-    return status_code, {"success": exito, "mensaje": mensaje}
+    status_code = 200 if resultado["success"] else 400
+    return status_code, resultado
 
 
 # ==========================================
@@ -84,9 +138,14 @@ def endpoint_fichar_salida(request):
 
 @router.post("/emergencias", response={201: FichajeOut, 400: FichajeOut})
 def crear_emergencia_endpoint(request, payload: SolicitudEmergenciaIn):
-    """El docente reporta un problema técnico desde su celular."""
+    """El docente reporta un problema técnico desde su celular o la web."""
     docente_id = request.user.docente.id
-    exito, mensaje = procesar_solicitud_emergencia(docente_id, payload.slot_horario_id, payload.nota_docente)
+    exito, mensaje = procesar_solicitud_emergencia(
+        docente_id, 
+        payload.slot_horario_id, 
+        payload.nota_docente,
+        payload.fecha
+    )
     
     status_code = 201 if exito else 400
     return status_code, {"success": exito, "mensaje": mensaje}
@@ -128,30 +187,33 @@ def resolver_emergencia_endpoint(request, solicitud_id: int, payload: ResolverEm
 
 
 @router.get("/mis_clases_hoy", response=list[ClaseDisponibleOut])
-def listar_clases_del_dia(request):
+def listar_clases_del_dia(request, fecha: Optional[date] = None):
     """
-    Devuelve las clases que el docente tiene asignadas para el día actual.
+    Devuelve las clases que el docente tiene asignadas para el día indicado (o el día actual por defecto).
     El frontend (React) usa esto para llenar el combo (dropdown) en el panel web.
     """
     docente_id = request.user.docente.id
-    hoy = timezone.localdate()
-    dia_semana_actual = hoy.weekday()
+    target_date = fecha if fecha else timezone.localdate()
+    dia_semana_actual = target_date.weekday()
     
     # Buscamos las materias que dicta
-    materias_ids = AsignacionDocente.objects.filter(
-        docente_id=docente_id, activa=True, fecha_inicio__lte=hoy
-    ).values_list('materia_id', flat=True)
+    materias_ids = obtener_asignaciones_docente_vigentes(docente_id, target_date).values_list('materia_id', flat=True)
     
     # Filtramos los slots de esas materias que caen exactamente hoy
     slots_hoy = SlotHorario.objects.filter(
         materia_id__in=materias_ids, dia_semana=dia_semana_actual
-    ).select_related('materia')
+    ).select_related('materia').prefetch_related('materia__carreras_asociadas__carrera')
     
     # Formateamos para el frontend
     resultado = []
     for slot in slots_hoy:
+        carreras_codigos = ", ".join(
+            sorted({vinculo.carrera.codigo for vinculo in slot.materia.carreras_asociadas.all()})
+        )
+
         resultado.append({
             "slot_id": slot.id,
+            "carreras_codigos": carreras_codigos,
             "materia_nombre": slot.materia.nombre,
             "hora_inicio": slot.hora_inicio.strftime("%H:%M"),
             "hora_fin": slot.hora_fin.strftime("%H:%M")
@@ -189,8 +251,9 @@ def obtener_mis_materias_stats(request):
     hoy = timezone.localdate()
     
     asignaciones = AsignacionDocente.objects.filter(
-        docente_id=docente_id, 
-        activa=True
+        docente_id=docente_id,
+        activa=True,
+        materia__activa=True,
     ).select_related('materia')
     
     resultado = []
@@ -225,19 +288,23 @@ def obtener_mis_materias_stats(request):
         
         emergencias = SolicitudEmergencia.objects.filter(
             docente_id=docente_id,
-            slot_horario__materia=materia,
             fecha__range=(fecha_inicio, hasta_fecha)
         ).select_related('slot_horario')
-        emergencia_map = {(e.slot_horario_id, e.fecha): e for e in emergencias}
+        
+        emergencia_map = {}
+        emergencias_generales_map = {}
+        for e in emergencias:
+            if e.slot_horario_id:
+                if e.slot_horario.materia_id == materia.id:
+                    emergencia_map[(e.slot_horario_id, e.fecha)] = e
+            else:
+                emergencias_generales_map[e.fecha] = e
         
         curr_date = fecha_inicio
         while curr_date <= hasta_fecha:
-            # 1. Ignorar si es feriado o día bloqueado
-            if is_fecha_bloqueada(curr_date):
-                curr_date += timedelta(days=1)
-                continue
+            evento_calendario = obtener_evento_bloqueo(curr_date)
                 
-            # 2. Verificar si hay slots en este día de la semana
+            # 1. Verificar si hay slots en este día de la semana
             dia_semana_val = curr_date.weekday()
             slots_hoy = [s for s in slots if s.dia_semana == dia_semana_val]
             
@@ -268,8 +335,16 @@ def obtener_mis_materias_stats(request):
                             "detalle": f"Entrada: {entrada_str} - Salida: {salida_str}"
                         })
                 else:
-                    if clase_finalizada:
-                        emerg = emergencia_map.get((slot.id, curr_date))
+                    if evento_calendario:
+                        faltas_count += 1
+                        historial.append({
+                            "fecha": curr_date.strftime("%Y-%m-%d"),
+                            "tipo": "Evento Institucional",
+                            "estado": "Ausente Justificada",
+                            "detalle": f"Evento: {evento_calendario.descripcion}"
+                        })
+                    elif clase_finalizada:
+                        emerg = emergencia_map.get((slot.id, curr_date)) or emergencias_generales_map.get(curr_date)
                         if emerg:
                             if emerg.estado == EstadoSolicitud.PENDIENTE:
                                 faltas_count += 1
@@ -317,10 +392,15 @@ def obtener_mis_materias_stats(request):
         # Ordenamos el historial para que las fechas más recientes vayan primero
         historial.sort(key=lambda x: x["fecha"], reverse=True)
         
+        carreras_codigos = ", ".join(
+            sorted({vinculo.carrera.codigo for vinculo in materia.carreras_asociadas.all()})
+        )
+        
         resultado.append({
             "materia_id": materia.id,
             "materia_nombre": materia.nombre,
             "materia_anio": materia.anio,
+            "carreras_codigos": carreras_codigos,
             "dias_cursada": dias_cursada,
             "asistencias": asistencias_count,
             "asincronicas": asincronicas_count,

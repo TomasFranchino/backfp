@@ -43,7 +43,7 @@ def calcular_ausencias_dinamicas(mes: int, anio: int, institucion: str = None, a
 
     # 4. Precargar Slots Horarios para esas materias
     materias_ids = [a.materia_id for a in asignaciones]
-    slots = SlotHorario.objects.filter(materia_id__in=materias_ids)
+    slots = SlotHorario.objects.filter(materia_id__in=materias_ids).select_related('materia')
     
     # Agrupar slots por materia: {materia_id: [slot1, slot2]}
     slots_por_materia = defaultdict(list)
